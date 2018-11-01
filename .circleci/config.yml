@@ -1,0 +1,134 @@
+version: 2
+jobs:
+  validate-contributor:
+    machine: true
+    steps:
+      - checkout
+      - run:
+          name: Validate contributor license
+          command: ci/validate-contributor.sh
+
+  build-and-test-osx:
+    macos:
+      xcode: '9.0.1'
+    working_directory: ~/numenta/htmresearch-core
+    parallelism: 1
+    environment:
+      ARCHFLAGS: -arch x86_64
+      PYTHONPATH: ~/Library/Python/2.7/lib/python/site-packages
+      PYBIN: ~/Library/Python/2.7/bin
+    steps:
+      # Machine Setup
+      - run:
+          name: Make sure to use OS X in CircleCI Web UI
+          command: |
+            if [[ "$OSTYPE" != "darwin"* ]]; then
+              echo "Must set option to use OS X in CircleCI Web UI" && exit 1;
+            fi
+      - run: sudo systemsetup -settimezone 'GMT'
+      - run:
+          name: Restoring system python
+          command: |
+            brew update
+            brew uninstall python
+            curl https://bootstrap.pypa.io/get-pip.py | python - --user
+            echo 'export PATH=$HOME/Library/Python/2.7/bin:$PATH' >> $BASH_ENV 
+      - run:
+          name: Installing cmake 
+          command: |
+            git init `brew --repo`/Library/Taps/numenta/homebrew-build
+            brew extract cmake numenta/build --version=3.11.3
+            brew install cmake@3.11.3
+      - checkout
+      
+      # Dependencies
+      # Restore the dependency cache
+      - restore_cache:
+          keys:
+          # This branch if available
+          - v1-dep-{{ .Branch }}-
+          # Default branch if not
+          - v1-dep-master-
+          # Any branch if there are none on the default branch - this should be unnecessary if you have your default branch configured correctly
+          - v1-dep-
+      - run:
+          name: Installing dependencies
+          command: |
+            pip install --user --upgrade --ignore-installed setuptools setuptools-scm
+            pip install --no-cache-dir --user -r bindings/py/requirements.txt  --verbose || exit
+
+      # Save dependency cache
+      - save_cache:
+          key: v1-dep-{{ .Branch }}-{{ epoch }}
+          paths:
+          # This is a broad list of cache paths to include many possible development environments
+          # You can probably delete some of these entries
+          - vendor/bundle
+          - ~/virtualenvs
+          - ~/.m2
+          - ~/.ivy2
+          - ~/.bundle
+          - ~/.go_workspace
+          - ~/.gradle
+          - ~/.cache/bower
+    
+      # Build 
+      - run:
+          name: Compiling
+          environment:
+            VERBOSE: 1
+          command: |
+            mkdir -p build/scripts
+            cd build/scripts          
+            cmake ../.. -DCMAKE_BUILD_TYPE=Release -DNTA_COV_ENABLED=ON -DCMAKE_INSTALL_PREFIX=../release -DPY_EXTENSIONS_DIR=../../bindings/py/src/htmresearch_core
+            make | grep -v -F '\\-\\- Installing:'
+            make install 2>&1 | grep -v -F 'Installing:'
+      - run:
+          name: Build wheel distribution
+          command: |
+            python setup.py bdist_wheel
+      # Test
+      - run:
+          name: Running python tests
+          command: |
+            mkdir -p tests/py
+            pip install --user --no-index --find-links=`pwd`/bindings/py/dist/ htmresearch-core
+            py.test --junitxml=tests/py/py_test_report.xml bindings/py/tests
+      - run:
+          name: Running C++ Tests
+          command: |
+            build/release/bin/unit_tests --gtest_output=xml:tests/py/unit_tests_report.xml
+      - store_test_results:
+          path: tests
+      - store_artifacts:
+          path: bindings/py/dist
+      - persist_to_workspace:
+          root: bindings/py
+          paths: dist
+           
+  deploy-s3:
+    machine: true
+    steps:
+      - attach_workspace:
+          at: dist
+      - run:
+          name: Deploying to S3
+          command: |
+            pip install awscli --upgrade --user
+            tar -cvzf htmresearch-core-${CIRCLE_SHA1}-darwin64.tar.gz -C dist .
+            aws s3 cp htmresearch-core-${CIRCLE_SHA1}-darwin64.tar.gz s3://artifacts.numenta.org/numenta/htmresearch-core/circle/
+        
+workflows:
+  version: 2
+  build-test-deploy:
+    jobs:
+      - validate-contributor
+      - build-and-test-osx:
+          requires:
+            - validate-contributor
+      - deploy-s3:
+          requires: 
+            - build-and-test-osx
+          filters:
+            branches:
+              only: master

@@ -1,6 +1,6 @@
-﻿# ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Numenta Platform for Intelligent Computing (NuPIC)
-# Copyright (C) 2015, Numenta, Inc.  Unless you have an agreement
+# Copyright (C) 2017, Numenta, Inc.  Unless you have an agreement
 # with Numenta, Inc., for a separate license for this software code, the
 # following terms and conditions apply:
 #
@@ -19,17 +19,11 @@
 # http://numenta.org/licenses/
 # ----------------------------------------------------------------------
 
-"""This file builds and installs the NuPIC Core Python bindings."""
-
-import glob
 import os
 import shutil
-import subprocess
-import sys
-import tempfile
+import pkg_resources
 
-from setuptools import Command, find_packages, setup
-from setuptools.command.test import test as BaseTestCommand
+from setuptools import setup, find_packages
 from distutils.core import Extension
 
 
@@ -41,6 +35,26 @@ UNIX_PLATFORMS = [LINUX_PLATFORM, DARWIN_PLATFORM]
 WINDOWS_PLATFORMS = ["windows"]
 
 
+
+def nupicBindingsPrereleaseInstalled():
+  """
+  Make an attempt to determine if a pre-release version of nupic.bindings 
+  is installed already.
+
+  @return: boolean
+  """
+  try:
+    nupicDistribution = pkg_resources.get_distribution("nupic.bindings")
+    if pkg_resources.parse_version(nupicDistribution.version).is_prerelease:
+      # A pre-release dev version of nupic.bindings is installed.
+      return True
+  except pkg_resources.DistributionNotFound:
+    pass  # Silently ignore.  The absence of nupic.bindings will be handled by
+    # setuptools by default
+
+  return False
+
+
 def getVersion():
   """
   Get version from local file.
@@ -50,188 +64,80 @@ def getVersion():
 
 
 
-class CleanCommand(Command):
-  """Command for cleaning up intermediate build files."""
-
-  description = "Command for cleaning up generated extension files."
-  user_options = []
-
-
-  def initialize_options(self):
-    pass
-
-
-  def finalize_options(self):
-    pass
-
-
-  def run(self):
-    platform = getPlatformInfo()
-    files = getExtensionFileNames(platform)
-    for f in files:
-      try:
-        os.remove(f)
-      except OSError:
-        pass
+def parse_file(requirementFile):
+  try:
+    return [
+      line.strip()
+      for line in open(requirementFile).readlines()
+      if not line.startswith("#")
+    ]
+  except IOError:
+    return []
 
 
 
-def fixPath(path):
-  """
-  Ensures paths are correct for linux and windows
-  """
-  path = os.path.abspath(os.path.expanduser(path))
-  if path.startswith("\\"):
-    return "C:" + path
-
-  return path
-
-
-
-def findRequirements(platform):
+def findRequirements():
   """
   Read the requirements.txt file and parse into requirements for setup's
   install_requirements option.
   """
-  includePycapnp = platform not in WINDOWS_PLATFORMS
-  requirementsPath = fixPath(os.path.join(PY_BINDINGS, "requirements.txt"))
-  return [
-    line.strip()
-    for line in open(requirementsPath).readlines()
-    if not line.startswith("#") and (not line.startswith("pycapnp") or includePycapnp)
-  ]
+  PY_BINDINGS = os.path.dirname(os.path.realpath(__file__))
+  REPO_DIR = os.path.abspath(os.path.join(PY_BINDINGS, os.pardir, os.pardir))
+  requirementsPath = os.path.join(REPO_DIR, "requirements.txt")
+  requirements = parse_file(requirementsPath)
 
+  if nupicBindingsPrereleaseInstalled():
+    # User has a pre-release version of nupic.bindings installed, which is only
+    # possible if the user installed and built nupic.bindings from source and
+    # it is up to the user to decide when to update nupic.bindings.  We'll
+    # quietly remove the entry in requirements.txt so as to not conflate the
+    # two.
+    requirements = [req for req in requirements 
+                    if "nupic.bindings" not in req]
 
-
-class TestCommand(BaseTestCommand):
-  user_options = [("pytest-args=", "a", "Arguments to pass to py.test")]
-
-
-  def initialize_options(self):
-    BaseTestCommand.initialize_options(self)
-    self.pytest_args = [] # pylint: disable=W0201
-
-
-  def finalize_options(self):
-    BaseTestCommand.finalize_options(self)
-    self.test_args = []
-    self.test_suite = True
-
-
-  def run_tests(self):
-    import pytest
-    cwd = os.getcwd()
-    try:
-      os.chdir("tests")
-      errno = pytest.main(self.pytest_args)
-    finally:
-      os.chdir(cwd)
-    sys.exit(errno)
-
-
-
-def getPlatformInfo():
-  """Identify platform."""
-  if "linux" in sys.platform:
-    platform = "linux"
-  elif "darwin" in sys.platform:
-    platform = "darwin"
-  # win32
-  elif sys.platform.startswith("win"):
-    platform = "windows"
-  else:
-    raise Exception("Platform '%s' is unsupported!" % sys.platform)
-  return platform
-
-
-
-def getExtensionFileNames(platform):
-  if platform in WINDOWS_PLATFORMS:
-    libExtension = "pyd"
-  else:
-    libExtension = "so"
-  libNames = ("algorithms", "engine_internal", "math")
-  swigPythonFiles = ["{}.py".format(name) for name in libNames]
-  swigLibFiles = ["_{}.{}".format(name, libExtension) for name in libNames]
-  files = [os.path.join(PY_BINDINGS, "nupic", "bindings", name)
-           for name in list(swigPythonFiles + swigLibFiles)]
-  return files
-
-
-
-def getExtensionFiles(platform):
-  files = getExtensionFileNames(platform)
-  for f in files:
-    if not os.path.exists(f):
-      generateExtensions()
-      break
-
-  return files
-
-
-
-def generateExtensions():
-  tmpDir = tempfile.mkdtemp()
-  cwd = os.getcwd()
-  try:
-    scriptsDir = os.path.join(tmpDir, "scripts")
-    releaseDir = os.path.join(tmpDir, "release")
-    pyExtensionsDir = os.path.join(PY_BINDINGS, "nupic", "bindings")
-    os.mkdir(scriptsDir)
-    os.chdir(scriptsDir)
-    subprocess.check_call(
-        ["cmake", REPO_DIR, "-DCMAKE_INSTALL_PREFIX={}".format(releaseDir),
-         "-DPY_EXTENSIONS_DIR={}".format(pyExtensionsDir)])
-    subprocess.check_call(["make", "-j3"])
-    subprocess.check_call(["make", "install"])
-  finally:
-    shutil.rmtree(tmpDir, ignore_errors=True)
-    os.chdir(cwd)
+  return requirements
 
 
 
 if __name__ == "__main__":
-  platform = getPlatformInfo()
 
-  if platform == DARWIN_PLATFORM and not "ARCHFLAGS" in os.environ:
-    raise Exception("To build NuPIC Core bindings in OS X, you must "
-                    "`export ARCHFLAGS=\"-arch x86_64\"`.")
-
-  # Run CMake if extension files are missing.
-  getExtensionFiles(platform)
+  PY_BINDINGS = os.path.dirname(os.path.realpath(__file__))
+  REPO_DIR = os.path.abspath(os.path.join(PY_BINDINGS, os.pardir, os.pardir))
 
   # Copy the proto files into the proto Python package.
-  destDir = os.path.relpath(os.path.join("nupic", "proto"))
-  for protoPath in glob.glob(os.path.relpath(os.path.join(
-      "..", "..", "src", "nupic", "proto", "*.capnp"))):
+  destDir = os.path.relpath(os.path.join(PY_BINDINGS, "src", "htmresearch_core", "proto"))
+
+  # Copy the proto files into the proto Python package.
+  protoSchemasToCopy = [
+    "ApicalTiebreakTemporalMemoryProto.capnp"
+  ]
+
+
+  for schemaFilename in protoSchemasToCopy:
+    protoPath = os.path.relpath(os.path.join(REPO_DIR, "src", "nupic", "proto", schemaFilename))
     shutil.copy(protoPath, destDir)
 
-  print "\nSetup SWIG Python module"
   setup(
-    name="nupic.research.bindings",
+    # setuptools replaces "_" with "-", so package name is "htmresearch-core",
+    # import namespace "htmresearch_core".
+    name="htmresearch-core",
     version=getVersion(),
     # This distribution contains platform-specific C++ libraries, but they are not
     # built with distutils. So we must create a dummy Extension object so when we
     # create a binary file it knows to make it platform-specific.
-    ext_modules=[Extension('nupic.dummy', sources = ['dummy.c'])], 
-    namespace_packages=["nupic"],
-    install_requires=findRequirements(platform),
-    packages=find_packages(),
+    ext_modules=[Extension("htmresearch_core.dummy", sources=["dummy.c"])],
+    install_requires=findRequirements(),
+    package_dir = {"": "src"},
+    packages=find_packages("src"),
     package_data={
-        "nupic.proto": ["*.capnp"],
-        "nupic.bindings": ["*.so", "*.pyd"],
+      "htmresearch_core.proto": ["*.capnp"],
+      "htmresearch_core": ["*.so", "*.pyd"],
     },
-    extras_require = {"capnp": ["pycapnp==0.5.8"]},
-    zip_safe=False,
-    cmdclass={
-      "clean": CleanCommand,
-      "test": TestCommand,
-    },
-    description="Numenta Platform for Intelligent Computing - bindings",
+    description="Numenta's experimental C++ research code",
     author="Numenta",
     author_email="help@numenta.org",
-    url="https://github.com/numenta/nupic.core",
-    long_description = "Python bindings for nupic core.",
+    url="https://github.com/numenta/htmresearch-core",
+    long_description = "Python bindings for htmresearch-core.",
     classifiers=[
       "Programming Language :: Python",
       "Programming Language :: Python :: 2",
@@ -245,9 +151,4 @@ if __name__ == "__main__":
       "Intended Audience :: Science/Research",
       "Topic :: Scientific/Engineering :: Artificial Intelligence"
     ],
-    entry_points = {
-      "console_scripts": [
-        "nupic-bindings-check = nupic.bindings.check:checkMain",
-      ],
-    },
   )
